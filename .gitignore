@@ -1,0 +1,13 @@
+# SwiftPM build output and resolved-dependency state.
+#
+# Package.resolved is ignored on purpose: this package has zero dependencies,
+# so the file carries no information, and a committed one only ever shows up as
+# spurious diff noise after someone opens the package in Xcode.
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode local state
+*.xcuserdatad/
+xcuserdata/
+DerivedData/

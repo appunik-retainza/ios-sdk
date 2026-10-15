@@ -97,7 +97,12 @@ public struct RetainzaInAppHost<Content: View>: View {
     private func presentation(_ resolved: ResolvedInApp) -> some View {
         let callbacks = InAppCallbacks(
             onButton: { button in handleButton(button) },
-            onDismiss: { if let current { dismiss(current) } }
+            onDismiss: { if let current { dismiss(current) } },
+            onTrack: { event, properties in
+                guard let client = resolvedClient else { return }
+                // Not tied to the message: it may be gone before this finishes.
+                Task { try? await client.track(event, properties: properties) }
+            }
         )
 
         switch resolved.template {

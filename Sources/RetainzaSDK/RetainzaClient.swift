@@ -35,6 +35,8 @@ public actor RetainzaClient {
     /// authoritative when it returns something. `reset()` clears it, which is
     /// what stops one user's data leaking into the next on logout.
     private var cachedUserId: String?
+    /// The signed identity for one user id — see `setUserHash`. Memory only.
+    private var signedIdentity: (userId: String, userHash: String)?
 
     /// The last permission the app reported, mirrored so a device registration
     /// can carry it.
@@ -192,6 +194,32 @@ public actor RetainzaClient {
 
     // MARK: - Identity
 
+    /// Attach the signature your server issued for a user id.
+    ///
+    /// Your public key ships inside the app, so by itself it lets anyone who
+    /// extracts it act as any of your users. With identity verification turned
+    /// on for the environment, your server signs each user id
+    /// (`hex(HMAC-SHA256(identitySecret, userId))`) and returns it with the
+    /// session; pass it here, or as `identify(_:attributes:profile:userHash:)`.
+    /// The SDK then sends it with every call made for that user.
+    ///
+    /// Call it on every launch, alongside `identify`: it is kept in memory and
+    /// never written to storage on its own. `reset()` clears it. Pass `nil` to
+    /// clear it without resetting. A hash is only ever sent with the user id it
+    /// was set for; calls for any other id go out unsigned.
+    public func setUserHash(_ userHash: String?, userId: String? = nil) throws {
+        guard let userHash, !userHash.isEmpty else {
+            signedIdentity = nil
+            return
+        }
+        signedIdentity = (userId: try resolveUserId(userId), userHash: userHash)
+    }
+
+    private func userHash(for userId: String?) -> String? {
+        guard let signedIdentity, signedIdentity.userId == userId else { return nil }
+        return signedIdentity.userHash
+    }
+
     private func resolveUserId(_ explicit: String?) throws -> String {
         if let explicit, !explicit.isEmpty { return explicit }
         if let provided = config.userProvider?(), !provided.isEmpty { return provided }
@@ -219,6 +247,8 @@ public actor RetainzaClient {
         retryTask = nil
         retryAttempt = 0
         cachedUserId = nil
+        // After unregisterPush above, which is the last call made as this user.
+        signedIdentity = nil
         await queue.clear()
         // Session counters describe the PERSON, not the device: leaving them
         // behind would tell the next user they have opened the app 40 times.
@@ -242,7 +272,17 @@ public actor RetainzaClient {
     }
 
     @discardableResult
-    private func request(_ method: String, _ path: String, body: Data?) async throws -> Data {
+    private func request(
+        _ method: String,
+        _ path: String,
+        body: Data?,
+        /// The end user this call is for. Its signed identity, if one is set,
+        /// goes out as `X-Engage-User-Hash`. Decided here, at the transport,
+        /// so no call for a signed user can go out without it.
+        userId: String? = nil,
+        /// Overrides the lookup: a queued call replays with the hash it was made with.
+        userHash explicitHash: String? = nil
+    ) async throws -> Data {
         guard allowed() else {
             log.debug("\(method) \(path) suppressed — no consent")
             throw RetainzaError.consent(path: path)
@@ -255,6 +295,9 @@ public actor RetainzaClient {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("Bearer \(publicKey)", forHTTPHeaderField: "Authorization")
+        if let hash = explicitHash ?? userHash(for: userId) {
+            request.setValue(hash, forHTTPHeaderField: "X-Engage-User-Hash")
+        }
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = body
@@ -286,9 +329,9 @@ public actor RetainzaClient {
     /// Network errors and 5xx are retried; a 4xx is not — a malformed body or a
     /// bad key will fail the same way forever, and queueing it would block
     /// every event behind it.
-    private func postOrQueue(_ path: QueuePath, body: Data) async throws {
+    private func postOrQueue(_ path: QueuePath, body: Data, userId: String) async throws {
         do {
-            try await request("POST", path.rawValue, body: body)
+            try await request("POST", path.rawValue, body: body, userId: userId)
             // A successful send is the best possible signal that connectivity
             // is back, so opportunistically drain anything already queued.
             Task { await self.flushQueue() }
@@ -303,7 +346,8 @@ public actor RetainzaClient {
                     path: path,
                     body: String(decoding: body, as: UTF8.self),
                     queuedAt: now(),
-                    attempts: 0
+                    attempts: 0,
+                    userHash: userHash(for: userId)
                 )
             )
             log.debug("queued \(path.rawValue) for retry (\(await queue.size()) pending)")
@@ -319,7 +363,7 @@ public actor RetainzaClient {
         defer { flushing = false }
 
         let result = await queue.flush { call in
-            try await self.request("POST", call.path.rawValue, body: Data(call.body.utf8))
+            try await self.request("POST", call.path.rawValue, body: Data(call.body.utf8), userHash: call.userHash)
         }
         if result.sent > 0 { log.debug("flushed \(result.sent) queued call(s)") }
         if result.remaining > 0 {
@@ -370,7 +414,9 @@ public actor RetainzaClient {
     public func identify(
         _ userId: String,
         attributes: [String: AttrValue] = [:],
-        profile: RetainzaProfile = RetainzaProfile()
+        profile: RetainzaProfile = RetainzaProfile(),
+        /// Your server's signature for this user id — see `setUserHash`.
+        userHash: String? = nil
     ) async throws {
         // Reserved identity (first_name, phone, …) folds into the SAME
         // attribute bag as everything else, so a segment on "has a phone
@@ -387,11 +433,17 @@ public actor RetainzaClient {
 
         let merged = buildAttributes(supplied)
         cachedUserId = userId
+        if let userHash, !userHash.isEmpty {
+            signedIdentity = (userId: userId, userHash: userHash)
+        } else if let signedIdentity, signedIdentity.userId != userId {
+            // A different person: the previous user's signature must not linger.
+            self.signedIdentity = nil
+        }
         // Attribute NAMES only. The values are user data and never logged.
         log.debug("identify \(userId) [\(merged.keys.sorted().joined(separator: ", "))]")
 
         let payload = IdentifyBody(userId: userId, attributes: merged, email: email, locale: locale)
-        try await postOrQueue(.identify, body: try JSONEncoder().encode(payload))
+        try await postOrQueue(.identify, body: try JSONEncoder().encode(payload), userId: userId)
     }
 
     /// Update some attributes without touching the rest.
@@ -403,7 +455,7 @@ public actor RetainzaClient {
         let uid = try resolveUserId(userId)
         log.debug("setAttributes \(uid) [\(attributes.keys.sorted().joined(separator: ", "))]")
         let payload = IdentifyBody(userId: uid, attributes: attributes, email: nil, locale: nil)
-        try await postOrQueue(.identify, body: try JSONEncoder().encode(payload))
+        try await postOrQueue(.identify, body: try JSONEncoder().encode(payload), userId: uid)
     }
 
     // MARK: - Collections
@@ -424,7 +476,7 @@ public actor RetainzaClient {
         let body = CollectionsBody(userId: uid, ops: [
             .init(collection: collection, action: "upsert", item: item, id: nil),
         ])
-        try await postOrQueue(.collections, body: try JSONEncoder().encode(body))
+        try await postOrQueue(.collections, body: try JSONEncoder().encode(body), userId: uid)
     }
 
     /// Convenience for an id with no fields.
@@ -447,7 +499,7 @@ public actor RetainzaClient {
         let body = CollectionsBody(userId: uid, ops: [
             .init(collection: collection, action: "remove", item: nil, id: id),
         ])
-        try await postOrQueue(.collections, body: try JSONEncoder().encode(body))
+        try await postOrQueue(.collections, body: try JSONEncoder().encode(body), userId: uid)
     }
 
     /// Replace a collection wholesale. An empty array clears it.
@@ -472,7 +524,7 @@ public actor RetainzaClient {
         for item in items {
             ops.append(.init(collection: collection, action: "upsert", item: item, id: nil))
         }
-        try await postOrQueue(.collections, body: try JSONEncoder().encode(CollectionsBody(userId: uid, ops: ops)))
+        try await postOrQueue(.collections, body: try JSONEncoder().encode(CollectionsBody(userId: uid, ops: ops)), userId: uid)
     }
 
     /// Record an event; the server evaluates event-triggered campaigns.
@@ -487,7 +539,7 @@ public actor RetainzaClient {
         let uid = try resolveUserId(userId)
         log.debug("track \(event) [\(properties.keys.sorted().joined(separator: ", "))]")
         let payload = TrackBody(userId: uid, event: event, properties: properties, ts: now())
-        try await postOrQueue(.track, body: try JSONEncoder().encode(payload))
+        try await postOrQueue(.track, body: try JSONEncoder().encode(payload), userId: uid)
     }
 
     /// Register a device push token.
@@ -527,7 +579,7 @@ public actor RetainzaClient {
             tz: context.string(AutoAttribute.timezone),
             pushPermission: pushPermission?.rawValue
         )
-        try await request("POST", "/token", body: try JSONEncoder().encode(payload))
+        try await request("POST", "/token", body: try JSONEncoder().encode(payload), userId: uid)
         await install.markRegistered(token)
     }
 
@@ -555,7 +607,7 @@ public actor RetainzaClient {
         components.queryItems = items
         let query = components.percentEncodedQuery ?? ""
         do {
-            _ = try await request("DELETE", "/token?\(query)", body: nil)
+            _ = try await request("DELETE", "/token?\(query)", body: nil, userId: uid)
             log.debug("unregistered this device")
         } catch {
             // Logging out with no network is normal. The server-side claim on
@@ -595,7 +647,7 @@ public actor RetainzaClient {
         let uid = try resolveUserId(userId)
         log.debug("ackPush \(action.rawValue) \(msgId)")
         let payload = PushAckBody(userId: uid, msgId: msgId, action: action.rawValue)
-        try await request("POST", "/push/ack", body: try JSONEncoder().encode(payload))
+        try await request("POST", "/push/ack", body: try JSONEncoder().encode(payload), userId: uid)
     }
 
     // MARK: - In-app messages
@@ -604,7 +656,7 @@ public actor RetainzaClient {
     public func fetchPendingInApp(userId: String? = nil) async throws -> [InAppMessage] {
         let uid = try resolveUserId(userId)
         let escaped = uid.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? uid
-        let data = try await request("GET", "/inapp/pending?userId=\(escaped)", body: nil)
+        let data = try await request("GET", "/inapp/pending?userId=\(escaped)", body: nil, userId: uid)
         let envelope = try JSONDecoder().decode(PendingInAppResponse.self, from: data)
         return envelope.messages
     }
@@ -618,7 +670,7 @@ public actor RetainzaClient {
         let uid = try resolveUserId(userId)
         log.debug("ackInApp \(action.rawValue) \(msgId)")
         let payload = InAppAckBody(userId: uid, msgId: msgId, action: action.rawValue)
-        try await request("POST", "/inapp/ack", body: try JSONEncoder().encode(payload))
+        try await request("POST", "/inapp/ack", body: try JSONEncoder().encode(payload), userId: uid)
     }
 
     /// Register the renderer for incoming in-app messages.

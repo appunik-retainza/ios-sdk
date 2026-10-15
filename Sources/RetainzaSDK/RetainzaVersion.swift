@@ -11,5 +11,5 @@
 /// (`sdk/packages/sdk-core/src/version.ts`), for the same reason.
 public enum RetainzaVersion {
     /// Semantic version of the Retainza iOS SDK.
-    public static let current = "1.0.0"
+    public static let current = "1.1.0"
 }

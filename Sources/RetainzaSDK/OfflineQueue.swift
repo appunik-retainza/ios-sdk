@@ -38,6 +38,12 @@ public struct QueuedCall: Codable, Sendable, Equatable {
     public let queuedAt: Int64
     /// How many flush attempts this item has survived.
     public var attempts: Int
+    /// The signed identity that was current for this call's user when it was
+    /// made (see `RetainzaClient.setUserHash`). Kept with the item because a
+    /// queued call can outlive the app session that knew the hash, and a
+    /// project that enforces signed identity would refuse the replay without
+    /// it. Optional, so items queued by an earlier SDK version still decode.
+    public var userHash: String? = nil
 }
 
 /// Bounded, ordered, persisted offline queue for ingest calls.

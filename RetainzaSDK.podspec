@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name         = "RetainzaSDK"
-  s.version      = "1.0.0"
+  s.version      = "1.1.0"
   s.summary      = "Retainza — user engagement, push and in-app messaging for iOS."
   s.description  = <<~DESC
     The native iOS client for Retainza. Identify users, track events, register for

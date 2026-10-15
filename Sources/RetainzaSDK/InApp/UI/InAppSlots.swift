@@ -10,6 +10,8 @@ import SwiftUI
 struct InAppCallbacks {
     let onButton: (InAppButton) -> Void
     let onDismiss: () -> Void
+    /// `engage.track(...)` from an HTML document. The native templates never call it.
+    var onTrack: (String, [String: AttrValue]) -> Void = { _, _ in }
 }
 
 /// The slot renderer.

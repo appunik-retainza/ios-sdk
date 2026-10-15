@@ -202,6 +202,17 @@ struct InAppHtmlView: View {
                             callbacks.onButton(
                                 InAppButton(text: "", route: InAppRoute(screen: screen))
                             )
+                        },
+                        onBridge: { message in
+                            switch message {
+                            case .cta(let route):
+                                // No route: the message's own route, as for a native button.
+                                callbacks.onButton(InAppButton(text: "", route: route))
+                            case .dismiss:
+                                callbacks.onDismiss()
+                            case .track(let event, let properties):
+                                callbacks.onTrack(event, properties)
+                            }
                         }
                     )
                     .frame(height: frame == .fullscreen ? nil : 420)
@@ -241,9 +252,10 @@ private struct HtmlWebView: UIViewRepresentable {
     let html: String
     let onClose: () -> Void
     let onRoute: (String) -> Void
+    let onBridge: (InAppBridgeMessage) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onClose: onClose, onRoute: onRoute)
+        Coordinator(onClose: onClose, onRoute: onRoute, onBridge: onBridge)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -252,6 +264,19 @@ private struct HtmlWebView: UIViewRepresentable {
         // local storage that outlive the message.
         configuration.websiteDataStore = .nonPersistent()
         configuration.allowsInlineMediaPlayback = true
+        // JavaScript stays on, for the `engage.*` bridge the templates call.
+        // The boundary is the document's CSP (no network, no remote script, no
+        // frames: see InAppBridge), the navigation policy below, and the bridge
+        // parser, which forwards three verbs and nothing else. The same model
+        // as the Android and React Native SDKs.
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+        // Through a weak proxy: the content controller retains its handlers,
+        // and a handler that retained the coordinator would keep the whole
+        // web view alive after the message is gone.
+        configuration.userContentController.add(
+            WeakScriptMessageHandler(context.coordinator),
+            name: InAppBridge.handlerName
+        )
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
@@ -260,19 +285,46 @@ private struct HtmlWebView: UIViewRepresentable {
         webView.scrollView.bounces = false
         // The document is trusted only to render itself, so no base URL is
         // given — relative requests resolve to nothing rather than to a host.
-        webView.loadHTMLString(html, baseURL: nil)
+        webView.loadHTMLString(InAppBridge.document(html), baseURL: nil)
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {}
 
-    final class Coordinator: NSObject, WKNavigationDelegate {
+    static func dismantleUIView(_ webView: WKWebView, coordinator: Coordinator) {
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: InAppBridge.handlerName)
+    }
+
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         private let onClose: () -> Void
         private let onRoute: (String) -> Void
+        private let onBridge: (InAppBridgeMessage) -> Void
+        /// After a CTA or a dismissal the message is over: anything the page
+        /// posts later (a double tap, a script still running) is ignored rather
+        /// than acked twice.
+        private var finished = false
 
-        init(onClose: @escaping () -> Void, onRoute: @escaping (String) -> Void) {
+        init(
+            onClose: @escaping () -> Void,
+            onRoute: @escaping (String) -> Void,
+            onBridge: @escaping (InAppBridgeMessage) -> Void
+        ) {
             self.onClose = onClose
             self.onRoute = onRoute
+            self.onBridge = onBridge
+        }
+
+        func userContentController(
+            _ userContentController: WKUserContentController,
+            didReceive message: WKScriptMessage
+        ) {
+            // Only the document itself: a frame could not exist under the CSP,
+            // and this keeps it that way if the policy ever loosens.
+            guard message.frameInfo.isMainFrame, !finished,
+                  let parsed = InAppBridge.parse(message.body)
+            else { return }
+            if case .track = parsed {} else { finished = true }
+            onBridge(parsed)
         }
 
         func webView(
@@ -305,6 +357,20 @@ private struct HtmlWebView: UIViewRepresentable {
             // they were looking at.
             decisionHandler(.cancel)
         }
+    }
+}
+
+/// Holds the coordinator weakly for `WKUserContentController`, which retains
+/// every handler added to it.
+private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    private weak var target: WKScriptMessageHandler?
+
+    init(_ target: WKScriptMessageHandler) {
+        self.target = target
+    }
+
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        target?.userContentController(controller, didReceive: message)
     }
 }
 
